@@ -33,6 +33,7 @@
 #include <xf86drm.h>
 #include <stdbool.h>
 #include <sync/sync.h>
+#include <cutils/log.h>
 
 #include "loader.h"
 #include "egl_dri2.h"
@@ -40,6 +41,7 @@
 #include "platform_android_gralloc_drm.h"
 
 #define ALIGN(val, align)	(((val) + (align) - 1) & ~((align) - 1))
+extern int update_pfn(struct dri2_egl_display *dri2_dpy);
 
 struct droid_yuv_format {
    /* Lookup keys */
@@ -670,26 +672,44 @@ droid_create_image_from_prime_fd_yuv(_EGLDisplay *disp, _EGLContext *ctx,
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    struct android_ycbcr ycbcr;
+   gralloc1_rect_t accessRegion;
    size_t offsets[3];
    size_t pitches[3];
    int is_ycrcb;
    int fourcc;
    int ret;
 
-   if (!dri2_dpy->gralloc->lock_ycbcr) {
-      _eglLog(_EGL_WARNING, "Gralloc does not support lock_ycbcr");
-      return NULL;
-   }
+   if(dri2_dpy->gralloc_version == HARDWARE_MODULE_API_VERSION(1, 0)) {
+     if (!dri2_dpy->pfn_lockflex) {
+        _eglLog(_EGL_WARNING, "Gralloc does not support lockflex");
+        return NULL;
+     }
 
-   memset(&ycbcr, 0, sizeof(ycbcr));
-   ret = dri2_dpy->gralloc->lock_ycbcr(dri2_dpy->gralloc, buf->handle,
+     memset(&ycbcr, 0, sizeof(ycbcr));
+     ret = dri2_dpy->pfn_lockflex(dri2_dpy->gralloc1_dvc, buf->handle,
+                                       0, 0, &accessRegion, &ycbcr, 0);
+     if (ret) {
+        _eglLog(_EGL_WARNING, "gralloc->lockflex failed: %d", ret);
+        return NULL;
+     }
+   } else {
+     const gralloc_module_t *gralloc0;
+     gralloc0 = dri2_dpy->gralloc;
+
+     if (!gralloc0->lock_ycbcr) {
+        _eglLog(_EGL_WARNING, "Gralloc does not support lock_ycbcr");
+        return NULL;
+     }
+
+     memset(&ycbcr, 0, sizeof(ycbcr));
+     ret = gralloc0->lock_ycbcr(gralloc0, buf->handle,
                                        0, 0, 0, 0, 0, &ycbcr);
-   if (ret) {
-      _eglLog(_EGL_WARNING, "gralloc->lock_ycbcr failed: %d", ret);
-      return NULL;
+     if (ret) {
+        _eglLog(_EGL_WARNING, "gralloc->lock_ycbcr failed: %d", ret);
+        return NULL;
+     }
+     gralloc0->unlock(dri2_dpy->gralloc, buf->handle);
    }
-   dri2_dpy->gralloc->unlock(dri2_dpy->gralloc, buf->handle);
-
    /* When lock_ycbcr's usage argument contains no SW_READ/WRITE flags
     * it will return the .y/.cb/.cr pointers based on a NULL pointer,
     * so they can be interpreted as offsets. */
@@ -1051,10 +1071,11 @@ droid_open_device(struct dri2_egl_display *dri2_dpy)
 {
    int fd = -1, err = -EINVAL;
 
-   if (dri2_dpy->gralloc->perform)
-         err = dri2_dpy->gralloc->perform(dri2_dpy->gralloc,
-                                          GRALLOC_MODULE_PERFORM_GET_DRM_FD,
-                                          &fd);
+   const gralloc_module_t *gralloc0;
+   gralloc0 = dri2_dpy->gralloc;
+
+   if (gralloc0->perform)
+         err = gralloc0->perform(gralloc0, GRALLOC_MODULE_PERFORM_GET_DRM_FD, &fd);
    if (err || fd < 0) {
       _eglLog(_EGL_DEBUG, "fail to get drm fd");
       fd = -1;
@@ -1164,33 +1185,31 @@ dri2_initialize_android(_EGLDriver *drv, _EGLDisplay *dpy)
    dri2_dpy = calloc(1, sizeof(*dri2_dpy));
    if (!dri2_dpy)
       return _eglError(EGL_BAD_ALLOC, "eglInitialize");
-
-   dri2_dpy->fd = -1;
-   ret = hw_get_module(GRALLOC_HARDWARE_MODULE_ID,
-                       (const hw_module_t **)&dri2_dpy->gralloc);
-   if (ret) {
-      err = "DRI2: failed to get gralloc module";
+ 
+   ret = update_pfn(dri2_dpy);
+   if (ret)
       goto cleanup;
-   }
 
    dpy->DriverData = (void *) dri2_dpy;
 
-   dri2_dpy->fd = droid_open_device(dri2_dpy);
+   if(dri2_dpy->gralloc_version != HARDWARE_MODULE_API_VERSION(1, 0)) {
 
-   if (dri2_dpy->fd >= 0) {
-      dri2_dpy->driver_name = loader_get_driver_for_fd(dri2_dpy->fd);
-      if (dri2_dpy->driver_name == NULL) {
-         err = "DRI2: failed to get driver name";
-         goto cleanup;
-      }
+     dri2_dpy->fd = droid_open_device(dri2_dpy);
+     if (dri2_dpy->fd >= 0) {
+        dri2_dpy->driver_name = loader_get_driver_for_fd(dri2_dpy->fd);
+        if (dri2_dpy->driver_name == NULL) {
+           err = "DRI2: failed to get driver name";
+           goto cleanup;
+        }
 
-      if (!dri2_load_driver(dpy)) {
-         err = "DRI2: failed to load driver";
-         goto cleanup;
-      }
-   } else if (droid_probe_device(dpy) < 0) {
-      err = "DRI2: failed to open device";
-      goto cleanup;
+        if (!dri2_load_driver(dpy)) {
+           err = "DRI2: failed to load driver";
+           goto cleanup;
+        }
+     } else if (droid_probe_device(dpy) < 0) {
+        err = "DRI2: failed to open device";
+        goto cleanup;
+     }
    }
 
    dri2_dpy->is_render_node = drmGetNodeTypeFromFd(dri2_dpy->fd) == DRM_NODE_RENDER;
