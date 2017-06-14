@@ -25,6 +25,10 @@ int update_pfn(struct dri2_egl_display *dri2_dpy){
 
      dri2_dpy->pfn_lockflex = reinterpret_cast<GRALLOC1_PFN_LOCK_FLEX>\
                (dri2_dpy->gralloc1_dvc->getFunction(dri2_dpy->gralloc1_dvc, GRALLOC1_FUNCTION_LOCK_FLEX));
+
+     dri2_dpy->pfn_getformat = reinterpret_cast<GRALLOC1_PFN_GET_FORMAT>\
+               (dri2_dpy->gralloc1_dvc->getFunction(
+                       dri2_dpy->gralloc1_dvc, GRALLOC1_FUNCTION_GET_FORMAT));
      }
    }
    return ret;

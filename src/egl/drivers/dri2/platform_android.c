@@ -41,6 +41,7 @@
 #include "platform_android_gralloc_drm.h"
 
 #define ALIGN(val, align)	(((val) + (align) - 1) & ~((align) - 1))
+#define GRALLOC_DRM_GET_FORMAT   1
 extern int update_pfn(struct dri2_egl_display *dri2_dpy);
 
 struct droid_yuv_format {
@@ -144,6 +145,45 @@ static int get_format(int format)
       _eglLog(_EGL_WARNING, "unsupported native buffer format 0x%x", format);
    }
    return -1;
+}
+
+static int droid_resolve_format(struct dri2_egl_display *dri2_dpy,
+                     struct ANativeWindowBuffer *buf)
+{
+   int format;
+   int err;
+
+   _eglLog(_EGL_WARNING, "%s, format: %d", __func__, buf->format);
+   if (buf->format != HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED)
+      return buf->format;
+
+   if(dri2_dpy->gralloc_version == HARDWARE_MODULE_API_VERSION(1, 0)) {
+     _eglLog(_EGL_WARNING, "GrallocV1.0");
+     if (!dri2_dpy->pfn_getformat) {
+        _eglLog(_EGL_WARNING, "Gralloc does not support getformat");
+        return -1;
+     }
+
+     err = dri2_dpy->pfn_getformat(dri2_dpy->gralloc1_dvc, buf->handle, &format);
+   } else {
+     _eglLog(_EGL_WARNING, "GrallocV0.2");
+     const gralloc_module_t *gralloc0;
+     gralloc0 = dri2_dpy->gralloc;
+
+     if (!gralloc0->perform) {
+        _eglLog(_EGL_WARNING, "Gralloc does not support perform");
+        return -1;
+     }
+
+     err = gralloc0->perform(gralloc0, GRALLOC_DRM_GET_FORMAT, buf->handle, &format);
+   }
+
+   if (err) {
+      _eglLog(_EGL_WARNING, "gralloc getformat failed: %d", err);
+      return -1;
+   }
+
+   return format;
 }
 
 static int
@@ -679,6 +719,12 @@ droid_create_image_from_prime_fd_yuv(_EGLDisplay *disp, _EGLContext *ctx,
    int fourcc;
    int ret;
 
+   int format = droid_resolve_format(dri2_dpy, buf);
+   if (format < 0) {
+       _eglError(EGL_BAD_PARAMETER, "droid_resolve_format failed");
+       return NULL;
+   }
+
    if(dri2_dpy->gralloc_version == HARDWARE_MODULE_API_VERSION(1, 0)) {
      if (!dri2_dpy->pfn_lockflex) {
         _eglLog(_EGL_WARNING, "Gralloc does not support lockflex");
@@ -733,10 +779,10 @@ droid_create_image_from_prime_fd_yuv(_EGLDisplay *disp, _EGLContext *ctx,
 
    /* .chroma_step is the byte distance between the same chroma channel
     * values of subsequent pixels, assumed to be the same for Cb and Cr. */
-   fourcc = get_fourcc_yuv(buf->format, is_ycrcb, ycbcr.chroma_step);
+   fourcc = get_fourcc_yuv(format, is_ycrcb, ycbcr.chroma_step);
    if (fourcc == -1) {
       _eglLog(_EGL_WARNING, "unsupported YUV format, native = %x, is_ycrcb = %d, chroma_step = %d",
-              buf->format, is_ycrcb, ycbcr.chroma_step);
+              format, is_ycrcb, ycbcr.chroma_step);
       return NULL;
    }
 
@@ -782,18 +828,25 @@ static _EGLImage *
 droid_create_image_from_prime_fd(_EGLDisplay *disp, _EGLContext *ctx,
                                  struct ANativeWindowBuffer *buf, int fd)
 {
+   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    unsigned int pitch;
 
-   if (is_yuv(buf->format))
+   int format = droid_resolve_format(dri2_dpy, buf);
+   if (format < 0) {
+       _eglLog(EGL_BAD_PARAMETER, "droid_resolve_format failed");
+       return NULL;
+   }
+
+   if (is_yuv(format))
       return droid_create_image_from_prime_fd_yuv(disp, ctx, buf, fd);
 
-   const int fourcc = get_fourcc(buf->format);
+   const int fourcc = get_fourcc(format);
    if (fourcc == -1) {
       _eglError(EGL_BAD_PARAMETER, "eglCreateEGLImageKHR");
       return NULL;
    }
 
-   pitch = buf->stride * get_format_bpp(buf->format);
+   pitch = buf->stride * get_format_bpp(format);
    if (pitch == 0) {
       _eglError(EGL_BAD_PARAMETER, "eglCreateEGLImageKHR");
       return NULL;
